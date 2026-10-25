@@ -11,7 +11,7 @@ keep_vars = true
 [[d1_databases]]
 binding = "DB"
 database_name = "tgstore"
-database_id = "PUT-YOUR-D1-ID-HERE"
+database_id = "00aab0d3-fa9c-44c6-8ad9-150584fcf794"
 
 # one SQLite database per project lives in this Durable Object (free plan allows SQLite-backed ones)
 [[durable_objects.bindings]]
