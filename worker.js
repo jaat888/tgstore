@@ -5,6 +5,8 @@
 // Bindings:  DB (D1 database), SQLDB (Durable Object class ProjDB - only needed for project SQL, see wrangler.toml)
 // Secrets / variables (all optional):
 //   CHANNEL_ID, BOT_TOKEN, ADMIN_PASSWORD  -> auto setup + restore on first visit
+//   RESET_PASSWORD (min 6)  -> type it on the login page: it becomes the new admin password. Remove it afterwards.
+//   ADMIN_PASSWORD also works on the login page while it is set (stored password stays unchanged).
 //   TG_API (default https://api.telegram.org), CHUNK_MB (18), MAX_FILE_GB (25),
 //   MAX_CHUNKS (22: chunks one response may stream, free plan = 50 subrequests),
 //   SQL_MAX_ROWS (50000), SQL_SYNC_SECS (20: how soon a changed SQL db is backed up to Telegram),
@@ -149,6 +151,24 @@ async function isAdmin(req, s) {
     if (i > 0 && part.slice(0, i).trim() === "sid" && (await cookieOk(s, part.slice(i + 1).trim()))) return true;
   }
   return false;
+}
+// login with a password from Cloudflare variables (RESET_PASSWORD replaces the stored one, ADMIN_PASSWORD only lets you in)
+async function envPwLogin(env, s, pw) {
+  pw = String(pw || "").trim();
+  const rp = String(env.RESET_PASSWORD || "").trim();
+  if (rp.length >= 6 && timingEq(pw, rp)) {
+    s.admin_hash = await hashPw(rp);
+    await saveSettings(env, s);
+    await kvSet(env, "defpw", "0");
+    try {
+      await backupManifest(env, true);
+    } catch (e) {
+      console.log("backup after password reset failed:", e.message);
+    }
+    return true;
+  }
+  const ap = String(env.ADMIN_PASSWORD || "").trim();
+  return ap.length >= 5 && timingEq(pw, ap);
 }
 const FAILS = new Map();
 function throttled(ip, add) {
@@ -1217,7 +1237,7 @@ async function apiRoute(env, ctx, req, url, path) {
     if (!configured(s)) return err(400, "not set up yet");
     if (throttled(ip)) return err(429, "too many wrong passwords, wait 10 minutes");
     const b = await readJson(req);
-    if (await checkPw(String(b.password || ""), s.admin_hash)) return json(200, { ok: true }, cookieHeader(url, await makeCookie(s), 30 * 86400));
+    if ((await checkPw(String(b.password || ""), s.admin_hash)) || (await envPwLogin(env, s, b.password))) return json(200, { ok: true }, cookieHeader(url, await makeCookie(s), 30 * 86400));
     throttled(ip, true);
     return err(401, "wrong password");
   }
