@@ -10,7 +10,13 @@
 //   TG_API (default https://api.telegram.org), CHUNK_MB (18), MAX_FILE_GB (25),
 //   MAX_CHUNKS (22: chunks one response may stream, free plan = 50 subrequests),
 //   SQL_MAX_ROWS (50000), SQL_SYNC_SECS (20: how soon a changed SQL db is backed up to Telegram),
-//   HASH_UPLOADS=1 (Worker hashes uploads itself; default: browser/client sends sha), AUTO_BACKUP=0 (off)
+//   DB_CACHE_BLOCKS (40: 1 MB database blocks kept in RAM), SUBREQ_LIMIT (44: Telegram calls one SQL request may make; a paid plan can use more),
+//   DB_DISK_BLOCKS (1024: downloaded blocks also kept in Durable Object storage so a big query can go on in the next request),
+//   SQL_MAX_ROUNDS (20: how many times the Worker re-runs a query that ran out of Telegram calls; free plan allows 50 subrequests per request),
+//   SQL_MAX_SECS (85: stop re-running after this long and answer 503 - the finished part stays saved, send the query again),
+//   DB_MAX_DIRTY_BLOCKS (60), HASH_UPLOADS=1 (Worker hashes uploads itself; default: browser/client sends sha), AUTO_BACKUP=0 (off)
+
+import { makeProjDB } from "./sqldb.js";
 
 const SW_JS = "// tgstore download helper: one browser download = many Range requests (each one under the free-plan limit).\nself.addEventListener('install', function () { self.skipWaiting(); });\nself.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });\nself.addEventListener('fetch', function (e) {\n  var u = new URL(e.request.url);\n  if (u.origin === self.location.origin && u.pathname === '/xdl') e.respondWith(big(u));\n});\nasync function big(u) {\n  var t = u.searchParams.get('u') || '', name = u.searchParams.get('n') || 'download';\n  if (!/^\\/(dl|s)\\/[^\\/\\\\]/.test(t) || t.indexOf('//') >= 0) return new Response('bad link', { status: 400 });\n  var h;\n  try { h = await fetch(t, { headers: { Range: 'bytes=0-0' } }); } catch (x) { return new Response('network error', { status: 502 }); }\n  if (h.status !== 206 && h.status !== 200) return new Response('error ' + h.status, { status: h.status });\n  var m = /\\/(\\d+)$/.exec(h.headers.get('Content-Range') || '');\n  var size = m ? +m[1] : +h.headers.get('Content-Length');\n  var type = h.headers.get('Content-Type') || 'application/octet-stream';\n  try { if (h.body) h.body.cancel(); } catch (x) {}\n  var pos = 0, reader = null, fails = 0;\n  var stream = new ReadableStream({\n    async pull(c) {\n      for (;;) {\n        if (pos >= size) { c.close(); return; }\n        try {\n          if (!reader) {\n            var r = await fetch(t, { headers: { Range: 'bytes=' + pos + '-' } });\n            if (r.status !== 206 || !r.body) throw new Error('HTTP ' + r.status);\n            reader = r.body.getReader();\n          }\n          var x = await reader.read();\n          if (x.done) { reader = null; continue; }\n          pos += x.value.length; fails = 0;\n          c.enqueue(x.value);\n          return;\n        } catch (err) {\n          reader = null;\n          if (++fails > 8) { c.error(err); return; }\n          await new Promise(function (z) { setTimeout(z, 1000 * fails); });\n        }\n      }\n    },\n    cancel() { if (reader) reader.cancel().catch(function () {}); }\n  });\n  return new Response(stream, { headers: {\n    'Content-Type': type,\n    'Content-Length': String(size),\n    'Content-Disposition': \"attachment; filename*=UTF-8''\" + encodeURIComponent(name),\n    'Cache-Control': 'no-store'\n  } });\n}\n";
 const DASH_HTML = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Telegram Storage</title>\n<style>\n:root{--bg:#f4f5f7;--card:#fff;--tx:#1b1f24;--mut:#6a737d;--bd:#e3e6ea;--ac:#2a7de1;--ok:#1a9d55;--warn:#d98a00;--bad:#d1383d}\n@media(prefers-color-scheme:dark){:root{--bg:#0f1318;--card:#181e26;--tx:#e7ebf0;--mut:#8b96a3;--bd:#2a323d;--ac:#4c9aff;--ok:#38c172;--warn:#f0a928;--bad:#f0605f}}\n*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,sans-serif}\n.wrap{max-width:760px;margin:0 auto;padding:14px}\nheader{display:flex;align-items:center;justify-content:space-between;margin:6px 0 14px}\nh1{font-size:19px;margin:0}h2{font-size:16px;margin:0 0 10px}\n.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:14px}\n.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}\n.stat{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 12px}\n.stat b{display:block;font-size:20px}.stat span{color:var(--mut);font-size:12px}\n.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.sp{justify-content:space-between}\n.item{border-top:1px solid var(--bd);padding:10px 0}.item:first-of-type{border-top:0}\n.mut{color:var(--mut);font-size:13px}.chip{display:inline-block;font-size:11px;border-radius:99px;padding:1px 8px;border:1px solid var(--bd)}\n.ok{color:var(--ok);border-color:var(--ok)}.warn{color:var(--warn);border-color:var(--warn)}.bad{color:var(--bad);border-color:var(--bad)}\ninput,select{width:100%;padding:10px;border:1px solid var(--bd);border-radius:10px;background:var(--bg);color:var(--tx);font:inherit}\nbutton{padding:8px 12px;border:1px solid var(--bd);border-radius:10px;background:var(--card);color:var(--tx);font:inherit;cursor:pointer}\nbutton.p{background:var(--ac);border-color:var(--ac);color:#fff}button.d{color:var(--bad)}button:disabled{opacity:.5}\n.link{display:flex;gap:6px;margin-top:6px}.link input{font:12px ui-monospace,monospace}\n.bar{height:8px;background:var(--bd);border-radius:6px;overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:var(--ac);width:0}\n#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:10px;display:none;max-width:90%;z-index:9}\n.fname{word-break:break-all}label{display:block;margin:10px 0 4px;font-size:13px;color:var(--mut)}\n</style></head><body><div class=\"wrap\" id=\"app\"></div><div id=\"toast\"></div>\n<script>\nlet ST=null,FILTER=\"\",FILES=[],UP=null,URLJOB=null,PAUSED=false;\nconst $=s=>document.querySelector(s);\nconst esc=s=>String(s??\"\").replace(/[&<>\"']/g,c=>({\"&\":\"&amp;\",\"<\":\"&lt;\",\">\":\"&gt;\",'\"':\"&quot;\",\"'\":\"&#39;\"}[c]));\nconst fmt=n=>{const u=[\"B\",\"KB\",\"MB\",\"GB\",\"TB\"];let i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(1):n)+\" \"+u[i]};\nconst ago=s=>s==null?\"never\":s<90?s+\"s ago\":s<5400?Math.round(s/60)+\" min ago\":Math.round(s/3600)+\" h ago\";\nfunction toast(m,bad){const t=$(\"#toast\");t.textContent=m;t.style.background=bad?\"#b3282d\":\"#222\";t.style.display=\"block\";clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display=\"none\",bad?6000:3000)}\nasync function api(path,body){\n  const r=await fetch(path,{method:body===undefined?\"GET\":\"POST\",headers:{\"X-Dash\":\"1\",\"Content-Type\":\"application/json\"},body:body===undefined?undefined:JSON.stringify(body)});\n  let j={};try{j=await r.json()}catch(e){}\n  if(!r.ok)throw new Error(j.error||(\"HTTP \"+r.status));return j}\nasync function act(path,body,ok){try{const j=await api(path,body);if(j.warnings&&j.warnings.length)toast(\"Done, but: \"+j.warnings.join(\"; \"),true);else if(ok)toast(ok);await load();return j}catch(e){toast(e.message,true)}}\nasync function load(){ST=await api(\"/api/state\");if(ST.authed){FILES=await api(\"/api/files\"+(FILTER?\"?project=\"+FILTER:\"\"))}render()}\nfunction render(){\n  const a=$(\"#app\");\n  if(!ST.configured){a.innerHTML=`<header><h1>Telegram Storage</h1></header><div class=\"card\"><h2>First setup</h2>\n  <p class=\"mut\">Enter these once. If the server disk was ever reset, enter the <b>same channel id + any bot token</b> again and everything (bots, projects, links, files) is restored from the channel backup.</p>\n  <label>Admin password (empty = default: admin, change it later)</label><input id=\"s_pw\" type=\"password\" autocomplete=\"new-password\" placeholder=\"admin\">\n  <label>Channel ID (like -1001234567890)</label><input id=\"s_ch\" inputmode=\"text\">\n  <label>First bot token (from @BotFather)</label><input id=\"s_tk\" autocomplete=\"off\">\n  <p><button class=\"p\" onclick=\"doSetup()\">Start</button></p>\n  <label style=\"margin-top:18px\">Or restore from a backup file (no token needed)</label><input id=\"s_bf\" type=\"file\">\n  <p><button onclick=\"doRestore()\">Restore from file</button></p></div>`;return}\n  if(!ST.authed){a.innerHTML=`<header><h1>Telegram Storage</h1></header><div class=\"card\"><h2>Login</h2>\n  <label>Admin password</label><input id=\"l_pw\" type=\"password\" onkeydown=\"if(event.key=='Enter')doLogin()\">\n  <p><button class=\"p\" onclick=\"doLogin()\">Login</button></p></div>`;return}\n  const t=ST.totals,on=ST.bots.filter(b=>b.enabled).length;\n  const dl=(ST.pending_del||ST.del_fail)?`<span class=\"chip bad\">${ST.pending_del} old messages not deleted${ST.del_err?\": \"+esc(ST.del_err):\"\"} - give the bot 'Delete messages' right, then Clean up</span> `:\"\";\n  const bk=dl+(ST.backup_ok===false?`<span class=\"chip bad\">backup failing</span>`:ST.backed_rev===ST.rev?`<span class=\"chip ok\">backup up to date</span>`:`<span class=\"chip warn\">backup ${ago(ST.backup_age)}</span>`);\n  a.innerHTML=`<header><h1>Telegram Storage</h1><div class=\"row\">${bk}<button onclick=\"doLogout()\">Logout</button></div></header>\n  ${ST.default_pw?`<div class=\"card\" style=\"border-color:var(--bad)\"><b style=\"color:var(--bad)\">Default password \"admin\" is still active.</b>\n   <p class=\"mut\">Anyone who finds this link can try it. Change it now.</p><button class=\"p\" onclick=\"chPw()\">Change password</button></div>`:\"\"}\n  <div class=\"grid\" style=\"margin-bottom:14px\">\n   <div class=\"stat\"><b>${t.files}</b><span>files</span></div><div class=\"stat\"><b>${fmt(t.bytes)}</b><span>stored</span></div>\n   <div class=\"stat\"><b>${on}/${ST.bots.length}</b><span>bots enabled</span></div><div class=\"stat\"><b>${ST.projects.length}</b><span>projects</span></div></div>\n  <div class=\"card\"><div class=\"row sp\"><h2>Bots (${ST.bots.length})</h2></div>\n  ${ST.bots.map(b=>`<div class=\"item\"><div class=\"row sp\"><div><b>@${esc(b.name)}</b> <span class=\"mut\">id ${esc(b.id)}</span><br><span class=\"mut\">channel ${esc(b.channel)}${b.channel===ST.channel?\" (main)\":\"\"}</span><br>\n   <span class=\"mut\">${b.chunks} chunks · ${fmt(b.bytes)} · sent ${b.ok}${b.err?` · errors ${b.err}`:\"\"}</span>${b.last_err?`<br><span class=\"mut\" style=\"color:var(--bad)\">${esc(b.last_err)}</span>`:\"\"}</div>\n   <div>${b.cooling?`<span class=\"chip warn\">resting ${b.cooling}s</span> `:\"\"}<span class=\"chip ${b.enabled?\"ok\":\"bad\"}\">${b.enabled?\"enabled\":\"disabled\"}</span></div></div>\n   <div class=\"row\" style=\"margin-top:8px\"><button onclick=\"botToggle('${b.id}')\">${b.enabled?\"Disable\":\"Enable\"}</button>\n   <button onclick=\"botToken('${b.id}')\">Update token</button><button class=\"d\" onclick=\"botRemove('${b.id}')\">Remove</button></div></div>`).join(\"\")}\n  <div class=\"item\"><label>Add bot (token from @BotFather) - no limit</label><input id=\"nb\" autocomplete=\"off\">\n  <label>Channel id for this bot (empty = main channel ${esc(ST.channel)})</label>\n  <div class=\"row\"><input id=\"nbc\" list=\"chl\" style=\"flex:1\" inputmode=\"text\" placeholder=\"-100...\"><button class=\"p\" onclick=\"botAdd()\">Add</button></div>\n  <datalist id=\"chl\">${ST.channels.map(c=>`<option value=\"${esc(c.id)}\">`).join(\"\")}</datalist>\n  <p class=\"mut\">Make the bot an admin of that channel first (Post + Pin messages). A new channel id here simply starts a new channel; files are spread over all channels.</p></div>\n  <p class=\"mut\">Token revoked in BotFather? Use <b>Update token</b> with the new token; stored files stay readable.</p></div>\n  <div class=\"card\"><h2>Channels (${ST.channels.length})</h2>\n  ${ST.channels.map(c=>`<div class=\"item\"><b>${esc(c.id)}</b> ${c.main?`<span class=\"chip ok\">main (manifest backup)</span>`:\"\"}<br>\n   <span class=\"mut\">${c.enabled}/${c.bots} bots enabled · ${c.chunks} chunks · ${fmt(c.bytes)}</span></div>`).join(\"\")}</div>\n  <div class=\"card\"><h2>Projects</h2>\n  ${ST.projects.length?ST.projects.map(p=>{const url=location.origin+\"/p/\"+p.key;return `<div class=\"item\"><div class=\"row sp\"><div><b>${esc(p.name)}</b><br><span class=\"mut\">${p.files} files · ${fmt(p.bytes)}</span>${p.db?`<br><span class=\"mut\">SQL db ${fmt(p.db.size)} · ${p.db.dirty?\"sync pending\":\"synced \"+ago(Math.max(Math.round(Date.now()/1000)-p.db.synced,0))}${p.db.error?` · <span style=\"color:var(--bad)\">${esc(p.db.error)}</span>`:\"\"}</span>`:\"\"}</div>\n   <button onclick=\"setFilter('${p.id}')\">Files</button></div>\n   <div class=\"link\"><input readonly value=\"${esc(url)}\" onclick=\"this.select()\"><button onclick=\"copy('${esc(url)}')\">Copy</button></div>\n   <div class=\"row\" style=\"margin-top:8px\"><button onclick=\"projRotate('${p.id}')\">New link</button><button class=\"d\" onclick=\"projDelete('${p.id}','${esc(p.name).replace(/'/g,\"\")}')\">Delete</button></div></div>`}).join(\"\"):`<p class=\"mut\">No project yet. Create one, then give its link to your app.</p>`}\n  <div class=\"item\"><div class=\"row\"><input id=\"np\" style=\"flex:1\" placeholder=\"New project name\"><button class=\"p\" onclick=\"projCreate()\">Create</button></div></div></div>\n  <div class=\"card\"><h2>Upload</h2>${ST.projects.length?`<select id=\"up_p\">${ST.projects.map(p=>`<option value=\"${p.id}\">${esc(p.name)}</option>`).join(\"\")}</select>\n  <div style=\"margin-top:8px\"><input id=\"up_f\" type=\"file\"></div><p><button class=\"p\" id=\"up_b\" onclick=\"upStart()\">Upload</button></p>\n  <div class=\"bar\"><i id=\"up_bar\"></i></div><div class=\"mut\" id=\"up_t\"></div>\n  <p class=\"mut\" style=\"margin-top:12px\">Parts of a file go up 3 at a time. Upload from a link is not in the Worker version.</p>`:`<p class=\"mut\">Create a project first.</p>`}</div>\n  <div class=\"card\"><h2>SQL</h2>${ST.projects.length?`<select id=\"q_p\">${ST.projects.map(p=>`<option value=\"${p.id}\">${esc(p.name)}</option>`).join(\"\")}</select>\n  <textarea id=\"q_s\" rows=\"4\" placeholder=\"SELECT name FROM sqlite_master\" style=\"width:100%;margin-top:8px;padding:10px;border:1px solid var(--bd);border-radius:10px;background:var(--bg);color:var(--tx);font:13px ui-monospace,monospace\"></textarea>\n  <div class=\"row\" style=\"margin-top:8px\"><button class=\"p\" onclick=\"sqlRun()\">Run</button><button onclick=\"sqlSync()\">Backup now</button></div><div id=\"q_o\" style=\"overflow:auto;margin-top:8px\"></div>\n  <p class=\"mut\" style=\"margin-top:8px\">Apps use POST /p/KEY/sql with {\"sql\":\"...\",\"params\":[...]}, {\"batch\":[...]} or {\"script\":\"...\"}. Changes are backed up to Telegram a few seconds later.</p>`:`<p class=\"mut\">Create a project first.</p>`}</div>\n  <div class=\"card\"><div class=\"row sp\"><h2>Files</h2><select id=\"flt\" style=\"width:auto\" onchange=\"setFilter(this.value)\"><option value=\"\">All projects</option>${ST.projects.map(p=>`<option value=\"${p.id}\" ${FILTER===p.id?\"selected\":\"\"}>${esc(p.name)}</option>`).join(\"\")}</select></div>\n  ${FILES.length?FILES.map(f=>{const pn=(ST.projects.find(p=>p.id===f.project)||{}).name||\"\";return `<div class=\"item\"><div class=\"fname\"><b>${esc(f.name)}</b></div>\n   <div class=\"mut\">${fmt(f.size)} · ${esc(pn)} · ${f.done?\"complete\":Math.round(f.stored/Math.max(f.size,1)*100)+\"% (unfinished)\"} · id ${esc(f.id)}</div>\n   <div class=\"row\" style=\"margin-top:6px\">${f.done?`<button onclick=\"bigDl('${esc(f.id)}')\">Download</button>`:\"\"}${f.done&&!f.share?`<button onclick=\"shareAct('${esc(f.id)}','get')\">Get public link</button>`:\"\"}${f.done&&f.share?`<button onclick=\"copyLink('${esc(f.id)}')\">Copy file link</button><button onclick=\"copyLink('${esc(f.id)}',1)\">Copy player link</button><button onclick=\"shareAct('${esc(f.id)}','off')\">Stop sharing</button>`:\"\"}<button class=\"d\" onclick=\"fileDel('${esc(f.id)}')\">Delete</button></div></div>`}).join(\"\"):`<p class=\"mut\">No files.</p>`}</div>\n  <div class=\"card\"><h2>Settings</h2><p class=\"mut\">Main channel ${esc(ST.channel)} · up ${ago(ST.uptime).replace(\" ago\",\"\")} · chunk ${ST.chunk_mb} MB · manifest rev ${ST.rev}</p>\n  <div class=\"row\"><button onclick=\"act('/api/backup',{},'Backup sent')\">Backup now</button><button onclick=\"dlBackup()\">Download backup</button><button onclick=\"act('/api/cleanup',{},'Clean up done')\">Clean up</button><button onclick=\"chPw()\">Change password</button></div></div>`}\nasync function doSetup(){try{const j=await api(\"/api/setup\",{password:$(\"#s_pw\").value,channel_id:$(\"#s_ch\").value,token:$(\"#s_tk\").value});\n  if(j.restored)toast(\"Backup found and restored. Login with your OLD password.\");else if(j.warnings.length)toast(\"Ready, but: \"+j.warnings.join(\"; \"),true);await load()}catch(e){toast(e.message,true)}}\nasync function doRestore(){const f=$(\"#s_bf\").files[0];if(!f)return toast(\"Choose the backup file first\",true);\n  try{const r=await fetch(\"/api/restore\",{method:\"POST\",headers:{\"X-Dash\":\"1\"},body:f});const j=await r.json().catch(()=>({}));\n    if(!r.ok)throw new Error(j.error||(\"HTTP \"+r.status));toast(\"Restored. Login with your OLD password.\");await load()}catch(e){toast(e.message,true)}}\nasync function dlBackup(){try{const r=await fetch(\"/api/backup/download\",{headers:{\"X-Dash\":\"1\"}});if(!r.ok)throw new Error(\"HTTP \"+r.status);\n  const b=await r.blob(),a=document.createElement(\"a\");a.href=URL.createObjectURL(b);a.download=\"tgstore-backup.json.gz\";document.body.appendChild(a);a.click();a.remove();\n  toast(\"Backup downloaded. Keep it private: it contains your bot tokens.\")}catch(e){toast(e.message,true)}}\nasync function doLogin(){try{await api(\"/api/login\",{password:$(\"#l_pw\").value});await load()}catch(e){toast(e.message,true)}}\nasync function doLogout(){await api(\"/api/logout\",{});await load()}\nconst botAdd=()=>act(\"/api/bot/add\",{token:$(\"#nb\").value.trim(),channel:$(\"#nbc\").value.trim()},\"Bot added\");\nconst botToggle=id=>act(\"/api/bot/toggle\",{id});\nfunction botToken(id){const t=prompt(\"New token for this bot (same bot only):\");if(t)act(\"/api/bot/token\",{id,token:t.trim()},\"Token updated\")}\nfunction botRemove(id){if(confirm(\"Remove this bot?\"))act(\"/api/bot/remove\",{id},\"Bot removed\")}\nconst projCreate=()=>act(\"/api/project/create\",{name:$(\"#np\").value},\"Project created\");\nfunction projRotate(id){if(confirm(\"Old link will stop working. Continue?\"))act(\"/api/project/rotate\",{id},\"New link ready\")}\nfunction projDelete(id,n){if(confirm(\"Delete project '\"+n+\"' and ALL its files?\"))act(\"/api/project/delete\",{id},\"Project deleted\")}\nconst pubLink=(t,n)=>location.origin+\"/s/\"+t+\"/\"+encodeURIComponent(n);\nfunction copyLink(id,pg){const f=FILES.find(x=>x.id===id);if(f&&f.share)copy(pg?location.origin+\"/v/\"+f.share:pubLink(f.share,f.name))}\nfunction shareAct(id,mode){if(mode===\"off\"&&!confirm(\"Stop sharing? The old link will stop working.\"))return;act(\"/api/file/share\",{id,mode},mode===\"off\"?\"Sharing switched off\":\"Public link ready\")}\nfunction fileDel(id){if(confirm(\"Delete this file?\"))act(\"/api/file/delete\",{id},\"File deleted\")}\nfunction setFilter(v){FILTER=v;load()}\nfunction copy(t){if(navigator.clipboard)navigator.clipboard.writeText(t).then(()=>toast(\"Link copied\"),()=>prompt(\"Copy:\",t));else prompt(\"Copy:\",t)}\nfunction chPw(){const o=prompt(\"Old password:\");if(!o)return;const n=prompt(\"New password (min 6):\");if(n)act(\"/api/password\",{old:o,new:n},\"Password changed\")}\nasync function sqlRun(){const o=$('#q_o');o.textContent='...';try{const j=await api('/api/sql',{project:$('#q_p').value,sql:$('#q_s').value});\n  if(!j.columns.length){o.textContent='OK, rows changed: '+j.rowcount;return}\n  const td='padding:3px 8px;border-bottom:1px solid var(--bd);text-align:left';\n  o.innerHTML='<table style=\"border-collapse:collapse;font:12px ui-monospace,monospace\"><tr>'+j.columns.map(c=>'<th style=\"'+td+'\">'+esc(c)+'</th>').join('')+'</tr>'+j.rows.map(r=>'<tr>'+r.map(v=>'<td style=\"'+td+'\">'+esc(v===null?'NULL':(v&&v.$blob)?'[blob]':v)+'</td>').join('')+'</tr>').join('')+'</table>'+(j.truncated?'<p class=\"mut\">result cut off</p>':'')}catch(e){o.textContent='';toast(e.message,true)}}\nasync function sqlSync(){try{const j=await api('/api/db/sync',{project:$('#q_p').value});toast(j.synced?'Backed up to Telegram':'Backup failed: '+(j.error||'?'),!j.synced)}catch(e){toast(e.message,true)}}\nasync function xdl(u,n){try{if(!('serviceWorker' in navigator))throw 0;await navigator.serviceWorker.register('/sw.js');await navigator.serviceWorker.ready;const a=document.createElement('a');a.href='/xdl?u='+encodeURIComponent(u)+'&n='+encodeURIComponent(n);a.download=n;document.body.appendChild(a);a.click();a.remove();toast('Download started')}catch(e){location.href=u}}\nfunction bigDl(id){const f=FILES.find(x=>x.id===id);if(f)xdl('/dl/'+id,f.name)}\nasync function upStart(){\n  const f=$(\"#up_f\").files[0],pid=$(\"#up_p\").value;if(!f)return toast(\"Choose a file first\",true);\n  if(ST.max_file&&f.size>ST.max_file)return toast(\"This file is bigger than the \"+fmt(ST.max_file)+\" limit\",true);\n  $(\"#up_b\").disabled=true;\n  const id=(\"w\"+Math.random().toString(36).slice(2,10)+Date.now().toString(36));\n  const sleep=ms=>new Promise(z=>setTimeout(z,ms));\n  const CH=ST.chunk_bytes||18*1048576,PAR=Math.max(1,ST.up_par||3),total=Math.ceil(f.size/CH);\n  const have=new Set(),prog={};\n  const show=()=>{let b=0;have.forEach(n=>{b+=Math.min(CH,f.size-n*CH)});for(const k in prog)b+=prog[k];const p=f.size?Math.min(b/f.size*100,100):100;\n    $(\"#up_bar\").style.width=p+\"%\";$(\"#up_t\").textContent=p.toFixed(1)+\"% · \"+fmt(Math.min(b,f.size))+\" of \"+fmt(f.size)};\n  async function sha(buf){try{if(window.crypto&&crypto.subtle){const h=await crypto.subtle.digest(\"SHA-256\",buf);return [...new Uint8Array(h)].map(x=>x.toString(16).padStart(2,\"0\")).join(\"\")}}catch(e){}return \"\"}\n  async function one(n){\n    const from=n*CH,end=Math.min(from+CH,f.size);\n    for(let a=0;a<8;a++){\n      try{\n        const blob=f.slice(from,end);let q=\"/api/upload?project=\"+pid+\"&id=\"+id+\"&name=\"+encodeURIComponent(f.name)+\"&offset=\"+from+\"&size=\"+f.size;\n        const h=await sha(await blob.arrayBuffer());if(h)q+=\"&sha=\"+h;\n        const x=await new Promise(res=>{const r=new XMLHttpRequest();r.open(\"POST\",q);r.setRequestHeader(\"X-Dash\",\"1\");\n          r.upload.onprogress=e=>{prog[n]=Math.min(e.loaded,end-from);show()};r.onloadend=()=>res(r);r.send(blob)});\n        delete prog[n];\n        if(x.status===200){have.add(n);show();return}\n        if(x.status===409&&/complete/.test(x.responseText)){have.add(n);return}\n        if(x.status===401||x.status===413||x.status===400)throw new Error((JSON.parse(x.responseText||\"{}\").error)||(\"HTTP \"+x.status));\n      }catch(e){delete prog[n];if(a>=7||/login|bigger|checksum|bad|choose/.test(String(e.message)))throw e}\n      await sleep(1500*(a+1))}\n    throw new Error(\"part \"+(n+1)+\" failed\")}\n  let done=false,lastErr=\"\";\n  for(let round=0;round<6&&!done;round++){\n    try{\n      if(round>0){await sleep(2000);let s=null;try{s=await api(\"/api/status/\"+id)}catch(e){}\n        if(s){if(s.done){done=true;break}have.clear();(s.have||[]).forEach(n=>have.add(n))}}\n      const todo=[];for(let n=0;n<Math.max(total,1);n++)if(!have.has(n))todo.push(n);\n      if(todo.length&&!have.size&&round===0){await one(todo.shift())}   // first part creates the file\n      let i=0;await Promise.all(Array.from({length:Math.min(PAR,todo.length)},async()=>{while(i<todo.length){await one(todo[i++])}}));\n      const s=await api(\"/api/status/\"+id);done=!!s.done;if(!done)lastErr=\"server has \"+(s.have||[]).length+\" of \"+total+\" parts\"\n    }catch(e){lastErr=e.message;if(/login|bigger|checksum|choose/.test(lastErr))break;$(\"#up_t\").textContent=\"interrupted (\"+lastErr+\"), resuming...\"}}\n  $(\"#up_b\").disabled=false;if(done){$(\"#up_bar\").style.width=\"100%\"}toast(done?\"Upload complete\":\"Upload failed\"+(lastErr?\": \"+lastErr:\"\"),!done);await load()}\nload().catch(e=>{$(\"#app\").innerHTML=\"<p>Cannot reach server: \"+esc(e.message)+\"</p>\"});\n</script></body></html>";
@@ -997,14 +1003,14 @@ async function state(env) {
   const projects = Object.entries(s.projects || {}).map(([pid, p]) => ({ id: pid, name: p.name, key: p.key, created: p.created || 0,
     files: (perProj[pid] || {}).files || 0, bytes: (perProj[pid] || {}).bytes || 0, db: null }));
   if (env.SQLDB) {
-    const recs = (await env.DB.prepare("SELECT k, v FROM kv WHERE k LIKE 'sqldb:%'").all()).results;
-    await Promise.all(recs.map(async (r) => {
-      const p = projects.find((x) => x.id === r.k.slice(6));
-      if (!p) return;
-      const rec = JSON.parse(r.v);
+    const dbsAll = JSON.parse((await kvGet(env, "dbs")) || "{}") || {};
+    const legacy = new Set((await env.DB.prepare("SELECT k FROM kv WHERE k LIKE 'sqldb:%'").all()).results.map((r) => r.k.slice(6)));
+    await Promise.all(projects.map(async (p) => {
+      const rec = dbsAll[p.id];
+      if (!rec && !legacy.has(p.id)) return;
       let inf = {};
-      try { inf = (await dbCall(env, p.id, "/info"))[1]; } catch (e) { /* ignore */ }
-      p.db = { size: inf.size || rec.size || 0, dirty: !!inf.dirty, synced: rec.at || 0, error: inf.error || "" };
+      try { inf = (await dbCall(env, p.id, "/info"))[1]; } catch (x) { /* ignore */ }
+      p.db = { size: inf.size || (rec && rec.size) || 0, dirty: !!inf.dirty, synced: inf.synced || (rec && rec.synced) || 0, error: inf.error || "" };
     }));
   }
   const rev = parseInt((await kvGet(env, "rev")) || "0", 10);
@@ -1144,6 +1150,15 @@ async function adminAction(env, ctx, path, b) {
     delete s.projects[pid];
     await saveSettings(env, s);
     await deleteMsgs(env, ents);
+    {
+      const dall = JSON.parse((await kvGet(env, "dbs")) || "{}") || {};
+      const drec = dall[pid];
+      if (drec) {
+        delete dall[pid];
+        await env.DB.batch([kvSetStmt(env, "dbs", JSON.stringify(dall)), revStmt(env)]);
+        await deleteMsgs(env, (drec.blocks || []).concat(drec.trash || []).map((x) => ({ bot: x.bot, ch: x.ch, msg: x.msg })));
+      }
+    }
     const srec = JSON.parse((await kvGet(env, "sqldb:" + pid)) || "null");
     if (env.SQLDB) { try { await dbCall(env, pid, "/wipe"); } catch (e) { console.log("sql wipe:", e && e.message); } }
     if (srec) {
@@ -1382,214 +1397,38 @@ function splitSql(text) {
   return out;
 }
 
-export class ProjDB {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.sql = state.storage.sql;
-    this.pid = null;
-    this.initP = null;
-  }
-  async remember(pid) {
-    if (pid && this.pid !== pid) { this.pid = pid; await this.state.storage.put("pid", pid); }
-    if (!this.pid) this.pid = (await this.state.storage.get("pid")) || null;
-  }
-  async fetch(req) {
-    const p = new URL(req.url).pathname;
-    try {
-      await this.remember(req.headers.get("x-pid"));
-      if (!this.pid) throw new BadReq("missing project");
-      if (p === "/info") return jd(200, await this.info());
-      if (p === "/wipe") { await this.wipe(); return jd(200, { ok: true }); }
-      if (p === "/sync") { const ok = await this.backup(true); return jd(200, { synced: ok, error: (await this.state.storage.get("err")) || "" }); }
-      if (p === "/dump") { await this.ensureInit(); return jd(200, this.dump()); }
-      if (p === "/run") {
-        const body = await req.json();
-        await this.ensureInit();
-        const res = await this.run(body);
-        if (body && body.sync) {
-          res.synced = await this.backup(true);
-          if (!res.synced) res.sync_error = (await this.state.storage.get("err")) || "";
-        }
-        return jd(200, res);
-      }
-      return jd(404, { error: "not found" });
-    } catch (e) {
-      if (e instanceof BadReq) return jd(400, { error: e.message });
-      if (e instanceof TGError) return jd(502, { error: "Telegram: " + (e.desc || e.message) });
-      console.log("sql error:", e && e.message);
-      return jd(400, { error: "sql: " + ((e && e.message) || e) });
-    }
-  }
-  // first use: empty Durable Object -> restore the Telegram backup if there is one
-  ensureInit() {
-    if (!this.initP) {
-      this.initP = (async () => {
-        if (await this.state.storage.get("init")) return;
-        const rec = JSON.parse((await kvGet(this.env, "sqldb:" + this.pid)) || "null");
-        if (rec && rec.parts && rec.parts.length) await this.restore(rec);
-        await this.state.storage.put("init", 1);
-      })().catch((e) => { this.initP = null; throw e; });
-    }
-    return this.initP;
-  }
-  async restore(rec) {
-    const s = await getSettings(this.env, true);
-    const bufs = [];
-    let total = 0;
-    for (const p of rec.parts) {
-      const path = await filePath(this.env, s, { bot: p.bot, tgid: p.fid }, true);
-      const r = await fetch(`${TG(this.env)}/file/bot${s.bots[String(p.bot)].token}/${path}`);
-      if (!r.ok) throw new TGError(r.status, "cannot download the SQL backup part " + p.n);
-      const u = new Uint8Array(await r.arrayBuffer());
-      bufs.push(u);
-      total += u.length;
-    }
-    const all = new Uint8Array(total);
-    let o = 0;
-    for (const u of bufs) { all.set(u, o); o += u.length; }
-    this.load(JSON.parse(dec.decode(await gunzip(all))));
-    console.log(`sql ${this.pid}: restored from Telegram (${human(total)})`);
-  }
-  async run(req) {
-    if (!req || typeof req !== "object" || Array.isArray(req)) throw new BadReq("body must be a JSON object");
-    const max = SQL_MAX_ROWS(this.env);
-    let wrote = false;
-    const one = (it) => {
-      if (!it || typeof it !== "object") throw new BadReq("each batch item must be an object");
-      const q = String(it.sql || "");
-      if (!q.trim()) throw new BadReq("sql is empty");
-      const prm = it.params == null ? [] : it.params;
-      if (!Array.isArray(prm)) throw new BadReq("params must be a list (use ? placeholders; named params are not supported in the Worker version)");
-      const cur = this.sql.exec(q, ...prm.map(sqlDec));
-      const cols = cur.columnNames || [];
-      const rows = [];
-      let trunc = false;
-      if (cols.length) {
-        for (const r of cur.raw()) {
-          if (rows.length >= max) { trunc = true; break; }
-          rows.push(r.map(sqlEnc));
-        }
-      } else cur.toArray();
-      const isRead = /^\s*(select|with|explain|values|pragma)\b/i.test(q);
-      let changes = 0, lastId = null;
-      if (!isRead || (cur.rowsWritten || 0) > 0) {
-        wrote = true;
-        try { const x = this.sql.exec("SELECT changes(), last_insert_rowid()").raw().next().value; changes = x[0]; lastId = x[1]; } catch (e) { /* ignore */ }
-      }
-      return { columns: cols, rows, rowcount: cols.length ? rows.length : changes, last_id: lastId, truncated: trunc };
-    };
-    let res;
-    const st = this.state.storage;
-    if (req.script != null) {
-      const stmts = splitSql(String(req.script).replace(/^\s*(BEGIN(\s+TRANSACTION)?|COMMIT|END(\s+TRANSACTION)?)\s*;\s*$/gim, "").replace(/^\s*PRAGMA\s+foreign_keys\s*=\s*\w+\s*;\s*$/gim, ""));
-      st.transactionSync(() => { try { this.sql.exec("PRAGMA defer_foreign_keys = ON"); } catch (e) { /* ignore */ } for (const q of stmts) this.sql.exec(q).toArray(); });
-      wrote = true;
-      res = { ok: true, statements: stmts.length };
-    } else if (req.batch != null) {
-      if (!Array.isArray(req.batch) || !req.batch.length) throw new BadReq("batch must be a non-empty list");
-      res = { results: st.transactionSync(() => req.batch.map(one)) };
-    } else res = one(req);
-    if (wrote) await this.afterWrite();
-    return res;
-  }
-  async afterWrite() {
-    const st = this.state.storage;
-    await st.put("dirty", 1);
-    if ((await st.getAlarm()) == null) await st.setAlarm(Date.now() + SQL_SYNC_SECS(this.env) * 1000);
-  }
-  async alarm() {
-    await this.remember(null);
-    try { await this.backup(false); } catch (e) { console.log("sql backup:", e && e.message); }
-  }
-  dump() {
-    const objs = this.sql.exec("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'").toArray();
-    const out = { v: 1, schema: objs, data: {}, seq: [] };
-    for (const t of objs.filter((o) => o.type === "table")) {
-      const cur = this.sql.exec(`SELECT * FROM ${sqlQ(t.name)}`);
-      out.data[t.name] = { cols: cur.columnNames, rows: [...cur.raw()].map((r) => r.map(sqlEnc)) };
-    }
-    try { out.seq = this.sql.exec("SELECT name, seq FROM sqlite_sequence").toArray(); } catch (e) { /* no autoincrement tables */ }
-    return out;
-  }
-  load(d) {
-    this.state.storage.transactionSync(() => {
-      try { this.sql.exec("PRAGMA defer_foreign_keys = ON"); } catch (e) { /* ignore */ }
-      for (const o of d.schema.filter((x) => x.type === "table")) this.sql.exec(o.sql);
-      for (const [name, t] of Object.entries(d.data || {})) {
-        if (!t.rows.length) continue;
-        const ins = `INSERT INTO ${sqlQ(name)} (${t.cols.map(sqlQ).join(",")}) VALUES (${t.cols.map(() => "?").join(",")})`;
-        for (const r of t.rows) this.sql.exec(ins, ...r.map(sqlDec));
-      }
-      for (const o of d.schema.filter((x) => x.type !== "table")) this.sql.exec(o.sql); // indexes, views, triggers last
-      for (const q of d.seq || []) { try { this.sql.exec("INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES(?, ?)", q.name, q.seq); } catch (e) { /* ignore */ } }
-    });
-  }
-  async backup(force) {
-    const st = this.state.storage;
-    if (!force && !(await st.get("dirty"))) return true;
-    if (force && !(await st.get("dirty")) && (await st.get("synced"))) return true;
-    const s = await getSettings(this.env, true);
-    if (!s.projects || !s.projects[this.pid]) { await this.wipe(); return true; } // project was deleted
-    await st.put("dirty", 0); // writes that arrive while we upload mark it dirty again
-    try {
-      const gz = await gzip(enc.encode(JSON.stringify(this.dump())));
-      await pushDbBackup(this.env, this.pid, gz, { size: this.sql.databaseSize || 0 });
-      await st.put("synced", Date.now());
-      await st.put("err", "");
-      if (await st.get("dirty")) await st.setAlarm(Date.now() + SQL_SYNC_SECS(this.env) * 1000);
-      return true;
-    } catch (e) {
-      await st.put("dirty", 1);
-      await st.put("err", String((e && (e.desc || e.message)) || e).slice(0, 160));
-      await st.setAlarm(Date.now() + 60000);
-      console.log("sql backup failed:", e && e.message);
-      return false;
-    }
-  }
-  async info() {
-    const st = this.state.storage;
-    let size = 0;
-    try { size = this.sql.databaseSize || 0; } catch (e) { /* ignore */ }
-    return { init: !!(await st.get("init")), size, dirty: !!(await st.get("dirty")), synced: Math.round(((await st.get("synced")) || 0) / 1000), error: (await st.get("err")) || "" };
-  }
-  async wipe() {
-    try { await this.state.storage.deleteAlarm(); } catch (e) { /* ignore */ }
-    await this.state.storage.deleteAll();
-    this.initP = null;
-  }
-}
-
-// upload the gzip dump as 1..n Telegram documents, record it, then delete the previous backup messages
-async function pushDbBackup(env, pid, gz, extra) {
-  const s = await getSettings(env, true);
-  const old = JSON.parse((await kvGet(env, "sqldb:" + pid)) || "null") || {};
-  const csz = CHUNK(env), fid = "sqldb_" + pid;
-  const parts = [];
-  try {
-    for (let i = 0, n = Math.max(1, Math.ceil(gz.length / csz)); i < n; i++) parts.push(await sendChunk(env, s, fid, i, gz.subarray(i * csz, (i + 1) * csz)));
-  } catch (e) {
-    await deleteMsgs(env, parts);
-    throw e;
-  }
-  const rec = Object.assign({ at: now(), gz: gz.length }, extra || {}, {
-    parts: parts.map((p) => ({ n: p.n, bot: Number(p.bot) || p.bot, ch: p.ch, msg: p.msg, fid: p.tgid, size: p.size })),
-  });
-  await env.DB.batch([kvSetStmt(env, "sqldb:" + pid, JSON.stringify(rec)), revStmt(env)]);
-  // the pinned manifest must point at the new parts BEFORE the old ones are deleted (it is what restores everything after a wipe)
-  try { await backupManifest(env, true); } catch (e) { console.log("manifest backup after sql backup:", e && e.message); }
-  await deleteMsgs(env, (old.parts || []).map((p) => ({ bot: p.bot, ch: p.ch, msg: p.msg })));
-  return rec;
-}
+// (the SQL engine - wa-sqlite on 1 MB Telegram blocks - lives in sqldb.js; the class is exported at the end of this file)
 
 async function dbCall(env, pid, path, body) {
   if (!env.SQLDB) throw new ApiError(501, "SQL needs the Durable Object binding SQLDB (see wrangler.toml)");
   const stub = env.SQLDB.get(env.SQLDB.idFromName("p:" + pid));
-  const r = await stub.fetch("https://sql.internal" + path, {
-    method: "POST", headers: { "Content-Type": "application/json", "x-pid": pid }, body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const j = await r.json().catch(() => ({ error: "bad reply from the SQL object" }));
-  return [r.status, j];
+  const once = async () => {
+    const r = await stub.fetch("https://sql.internal" + path, {
+      method: "POST", headers: { "Content-Type": "application/json", "x-pid": pid }, body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({ error: "bad reply from the SQL object" }));
+    return [r.status, j];
+  };
+  if (path !== "/run") return once();
+  // A query that needs more Telegram blocks than ONE request may fetch (free plan: 50 calls) is rolled back by the Durable Object
+  // with 503 {retry:true}; the blocks it downloaded stay saved there. Here it is simply run again - every round is a NEW request
+  // with a fresh budget that finds the earlier blocks on disk and fetches the next ones - until it finishes.
+  const rounds = Math.max(1, Math.min(45, parseInt(env.SQL_MAX_ROUNDS || "20", 10) || 20));
+  const maxMs = Math.max(5, parseInt(env.SQL_MAX_SECS || "85", 10) || 85) * 1000;
+  const t0 = Date.now();
+  let res = null, i = 0;
+  for (; i < rounds; i++) {
+    res = await once();
+    const [c, j] = res;
+    if (c !== 503 || !j || !j.retry) {
+      if (c === 200 && j && i > 0) j.rounds = i + 1; // how many requests it took
+      return res;
+    }
+    if (Date.now() - t0 > maxMs) { i++; break; }
+  }
+  const j = res[1];
+  j.error = String(j.error || "") + ` (the Worker already re-ran it ${i} times; the blocks loaded so far are saved - send the same query again to go on)`;
+  return res;
 }
 const runSql = async (env, pid, body) => { const [c, j] = await dbCall(env, pid, "/run", body); return json(c, j); };
 
@@ -1633,3 +1472,11 @@ export default {
     }
   },
 };
+
+// the project SQL Durable Object (wa-sqlite engine, database file in Telegram blocks) - see sqldb.js
+export const ProjDB = makeProjDB({
+  kvGet, kvSetStmt, revStmt, getSettings, filePath, sendChunk, deleteMsgs, backupManifest,
+  TG, TGError, hex, gunzip, sleep, splitSql, SQL_MAX_ROWS, SQL_SYNC_SECS,
+  fpCached: (row) => { const c = FP.get(`${row.bot}:${row.tgid}`); return !!c && Date.now() - c.t < 45 * 60000; },
+  enabledBotCount: (s) => enabledBots(s).length,
+});

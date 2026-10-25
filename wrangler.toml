@@ -1,6 +1,8 @@
 # Deploy with wrangler (or connect this repo in Cloudflare: Workers & Pages -> Create -> Import a repository).
 # The SQL feature needs the Durable Object below, and a Durable Object class can only be added by a wrangler/Git
 # deploy, NOT by pasting code in the dashboard editor. Without it everything else still works (SQL answers 501).
+# SQL = wa-sqlite (package.json) running in the Durable Object, database file stored as 1 MB blocks in Telegram (sqldb.js).
+# Deploy the WHOLE folder: worker.js + sqldb.js + package.json + wrangler.toml (Cloudflare runs npm install by itself).
 name = "tgstore"
 main = "worker.js"
 compatibility_date = "2025-01-01"
