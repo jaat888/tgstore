@@ -437,6 +437,8 @@ export function makeProjDB(H) {
         store.cidx = Array.isArray(cidx) ? cidx : [];
         this.store = store;
         const module = await SQLiteAsyncESMFactory({
+          // without locateFile the emscripten code runs new URL("wa-sqlite-async.wasm", import.meta.url) and Workers answer "Invalid URL string"
+          locateFile: (f) => f,
           instantiateWasm(imports, done) {
             WebAssembly.instantiate(wasmModule, imports).then((inst) => done(inst, wasmModule));
             return {};
