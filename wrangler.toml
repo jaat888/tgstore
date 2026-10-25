@@ -1,0 +1,26 @@
+# Deploy with wrangler (or connect this repo in Cloudflare: Workers & Pages -> Create -> Import a repository).
+# The SQL feature needs the Durable Object below, and a Durable Object class can only be added by a wrangler/Git
+# deploy, NOT by pasting code in the dashboard editor. Without it everything else still works (SQL answers 501).
+name = "tgstore"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# keep the variables/secrets you set in the Cloudflare dashboard when this repo redeploys (otherwise a git deploy can wipe them)
+keep_vars = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tgstore"
+database_id = "PUT-YOUR-D1-ID-HERE"
+
+# one SQLite database per project lives in this Durable Object (free plan allows SQLite-backed ones)
+[[durable_objects.bindings]]
+name = "SQLDB"
+class_name = "ProjDB"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProjDB"]
+
+# Do NOT put CHANNEL_ID / BOT_TOKEN / ADMIN_PASSWORD here (the repo is not secret).
+# Add them in the dashboard: Worker -> Settings -> Variables and Secrets.
