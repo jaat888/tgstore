@@ -34,6 +34,60 @@ const encV = (v) => {
   return v;
 };
 const decV = (v) => (v && typeof v === "object" && typeof v.$blob === "string" ? fromB64(v.$blob) : v === true ? 1 : v === false ? 0 : v);
+
+// Named parameters ({"id": 5} with :id / @id / $id in the SQL), like Python's sqlite3 in the old server.
+// They are turned into numbered ?N placeholders (same name = same number), so the engine only sees a normal list.
+// Strings, "quoted" / `quoted` / [quoted] names and comments are skipped, so a ':' inside them is left alone.
+function namedToPositional(sql, obj) {
+  const order = [];
+  let out = "", i = 0;
+  const n = sql.length;
+  const idc = (c) => /[A-Za-z0-9_]/.test(c);
+  while (i < n) {
+    const c = sql[i];
+    if (c === "'" || c === '"' || c === "`") {
+      let j = i + 1;
+      while (j < n) {
+        if (sql[j] === c) { if (sql[j + 1] === c) { j += 2; continue; } break; }
+        j++;
+      }
+      out += sql.slice(i, j + 1); i = j + 1; continue;
+    }
+    if (c === "[") {
+      const j = sql.indexOf("]", i + 1);
+      const e = j < 0 ? n : j + 1;
+      out += sql.slice(i, e); i = e; continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      const j = sql.indexOf("\n", i);
+      const e = j < 0 ? n : j;
+      out += sql.slice(i, e); i = e; continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      const j = sql.indexOf("*/", i + 2);
+      const e = j < 0 ? n : j + 2;
+      out += sql.slice(i, e); i = e; continue;
+    }
+    if ((c === ":" || c === "@" || c === "$") && i + 1 < n && idc(sql[i + 1])) {
+      let j = i + 1;
+      while (j < n && idc(sql[j])) j++;
+      const name = sql.slice(i + 1, j);
+      let k = order.indexOf(name);
+      if (k < 0) { order.push(name); k = order.length - 1; }
+      out += "?" + (k + 1);
+      i = j; continue;
+    }
+    out += c; i++;
+  }
+  const params = order.map((name) => {
+    for (const key of [name, ":" + name, "@" + name, "$" + name]) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
+    }
+    throw new BadReq(`missing value for named parameter ${name}`);
+  });
+  return { sql: out, params };
+}
+
 const ceilDiv = (a, b) => Math.floor((a + b - 1) / b);
 
 // ------------------------------------------------------------------ the database file: blocks in RAM <-> Telegram
@@ -576,10 +630,15 @@ export function makeProjDB(H) {
     async one(it) {
       const sq = this.sqlite3, db = this.db;
       if (!it || typeof it !== "object") throw new BadReq("each batch item must be an object");
-      const q = String(it.sql || "");
+      let q = String(it.sql || "");
       if (!q.trim()) throw new BadReq("sql is empty");
-      const prm = it.params == null ? [] : it.params;
-      if (!Array.isArray(prm)) throw new BadReq("params must be a list (use ? placeholders; named params are not supported)");
+      let prm = it.params == null ? [] : it.params;
+      if (prm && typeof prm === "object" && !Array.isArray(prm)) {
+        const c = namedToPositional(q, prm);   // {"id": 5} + :id  ->  ?1 + [5]
+        q = c.sql;
+        prm = c.params;
+      }
+      if (!Array.isArray(prm)) throw new BadReq("params must be a list or an object with names");
       const max = H.SQL_MAX_ROWS(this.env);
       let cols = [], rows = [], trunc = false, first = true;
       try {

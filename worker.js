@@ -606,13 +606,24 @@ async function sendChunk(env, s, fid, n, data) {
 // The request body goes straight into the Telegram request while it arrives: memory stays tiny and the Worker does almost
 // no CPU work (the old way copied the whole piece 3-4 times, which can break the free plan limits).
 // A streamed piece cannot be re-sent inside the same request, so on a Telegram error the client simply retries the piece.
-async function drainBody(body) {
-  const r = body.getReader();
+const makeSrc = (body) => ({ reader: body.getReader(), left: null });
+async function skipSrc(src, n) {
+  // throw away n bytes of the body (a piece that is already saved)
   try {
-    for (;;) if ((await r.read()).done) break;
+    while (n > 0) {
+      let v = src.left;
+      src.left = null;
+      if (!v) {
+        const r = await src.reader.read();
+        if (r.done) return;
+        v = r.value;
+      }
+      if (v.length > n) { src.left = v.subarray(n); return; }
+      n -= v.length;
+    }
   } catch (e) { /* client went away */ }
 }
-async function tgSendStream(env, token, method, fields, file, body, length) {
+async function tgSendStream(env, token, method, fields, file, src, length) {
   const boundary = "----tgs" + randHex(12);
   let head = "";
   for (const [k, v] of Object.entries(fields || {})) head += `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`;
@@ -621,18 +632,24 @@ async function tgSendStream(env, token, method, fields, file, body, length) {
   const tailB = enc.encode(`\r\n--${boundary}--\r\n`);
   const total = headB.length + length + tailB.length;
   const { readable, writable } = typeof FixedLengthStream !== "undefined" ? new FixedLengthStream(total) : new TransformStream();
-  const reader = body.getReader();
+  const reader = src.reader;
   const w = writable.getWriter();
   let pumpErr = null;
   const pump = (async () => {
     try {
       await w.write(headB);
       let got = 0;
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
+      while (got < length) {
+        let value = src.left;
+        src.left = null;
+        if (!value) {
+          const r = await reader.read();
+          if (r.done) break;
+          value = r.value;
+        }
+        const room = length - got;
+        if (value.length > room) { src.left = value.subarray(room); value = value.subarray(0, room); }
         got += value.length;
-        if (got > length) throw new Error("client sent more than Content-Length");
         await w.write(value);
       }
       if (got !== length) throw new Error("client closed early");
@@ -662,7 +679,7 @@ async function tgSendStream(env, token, method, fields, file, body, length) {
   if (!res.ok) throw new TGError(res.error_code || 0, res.description || "", (res.parameters || {}).retry_after || 0);
   return res.result;
 }
-async function sendChunkStream(env, s, fid, n, body, length) {
+async function sendChunkStream(env, s, fid, n, src, length) {
   const [id, wait] = pickUp(s, new Set());
   try {
     if (wait > 0) await sleep(Math.min(wait, 8) * 1000);
@@ -670,7 +687,7 @@ async function sendChunkStream(env, s, fid, n, body, length) {
     try {
       const m = await tgSendStream(env, s.bots[id].token, "sendDocument",
         { chat_id: ch, caption: `${fid}|${n}`, disable_notification: "true" },
-        { field: "document", name: `${fid}_${String(n).padStart(6, "0")}.bin` }, body, length);
+        { field: "document", name: `${fid}_${String(n).padStart(6, "0")}.bin` }, src, length);
       poolStat(id);
       return { n, bot: id, ch, msg: m.message_id, tgid: m.document.file_id, size: length };
     } catch (e) {
@@ -862,27 +879,36 @@ async function handleUpload(env, ctx, req, url, pid) {
   if (length === 0) return json(200, await statusInfo(env, f));
   if (length % csize !== 0 && offset + length !== total) return err(400, "send whole chunks (or the end of the file)", { chunk: csize });
   const nch = Math.ceil(length / csize);
-  const maxUp = Math.max(1, parseInt(env.MAX_UP_CHUNKS || "4", 10));
+  const maxUp = Math.max(1, parseInt(env.MAX_UP_CHUNKS || "12", 10));
   if (nch > maxUp) return err(413, `send at most ${maxUp} chunks (${maxUp * csize} bytes) per request`, { chunk: csize, max_chunks: maxUp });
 
   const first = offset / csize;
   const haveRows = (await env.DB.prepare("SELECT n FROM chunks WHERE fid = ? AND n >= ? AND n < ?").bind(fid, first, first + nch).all()).results;
   const have = new Set(haveRows.map((r) => r.n));
-  const useStream = nch === 1 && !!req.body && env.HASH_UPLOADS !== "1" && env.UP_STREAM !== "0";
+  const useStream = !!req.body && env.HASH_UPLOADS !== "1" && env.UP_STREAM !== "0";
   const readN = useStream ? null : bodyReader(req);
   const sha1 = q.get("sha") || "";
   const done = [];
   let failure = null;
   if (useStream) {
-    if (Math.min(csize, total - first * csize) !== length) return err(400, "bad piece length", { chunk: csize });
-    if (have.has(first)) await drainBody(req.body);
-    else {
+    let sum = 0;
+    for (let i = 0; i < nch; i++) sum += Math.min(csize, total - (first + i) * csize);
+    if (sum !== length) return err(400, "bad piece length", { chunk: csize });
+    const src = makeSrc(req.body);
+    for (let i = 0; i < nch; i++) {
+      const n = first + i;
+      const want = Math.min(csize, total - n * csize);
+      if (have.has(n)) {
+        await skipSrc(src, want);
+        continue;
+      }
       try {
-        const r = await sendChunkStream(env, s, fid, first, req.body, length);
-        r.sha = sha1;
+        const r = await sendChunkStream(env, s, fid, n, src, want);
+        r.sha = nch === 1 ? sha1 : "";
         done.push(r);
       } catch (e) {
         failure = e;
+        break;
       }
     }
   }
@@ -1398,7 +1424,7 @@ async function projectRoute(env, ctx, req, url, path) {
   const s = await getSettings(env);
   if (sub === "/" && method === "GET") {
     const r = await env.DB.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(stored), 0) AS b FROM files WHERE project = ?").bind(pid).first();
-    return json(200, { project: s.projects[pid].name, files: r.c, bytes: r.b, chunk: CHUNK(env), max_up_chunks: Math.max(1, parseInt(env.MAX_UP_CHUNKS || "4", 10)) });
+    return json(200, { project: s.projects[pid].name, files: r.c, bytes: r.b, chunk: CHUNK(env), max_up_chunks: Math.max(1, parseInt(env.MAX_UP_CHUNKS || "12", 10)) });
   }
   if (sub === "/sql" && method === "POST") {
     const body = await readJson(req, 30000000).catch((e) => { throw e instanceof ApiError ? e : new ApiError(400, "bad json"); });
