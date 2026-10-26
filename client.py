@@ -86,9 +86,11 @@ def upload(path):
         sys.exit(f"{name} is {size / 1e9:,.1f} GB; the limit is {MAX_FILE // 1024 ** 3} GB per file")
     fid = hashlib.sha1(f"{name}|{size}|{int(os.path.getmtime(path))}".encode()).hexdigest()[:16]
     fails = 0
-    chunk = 18 * 1024 * 1024
+    chunk = 8 * 1024 * 1024
     while True:
         try:
+            code, root = call("GET", "/")                       # the server tells which piece size it uses
+            chunk = (root.get("chunk") if code == 200 else 0) or chunk
             code, st = call("GET", f"/status/{fid}")
             stored = st.get("stored", 0) if code == 200 else 0
             chunk = st.get("chunk") or chunk
@@ -108,7 +110,7 @@ def upload(path):
                     if code == 413 and "chunk" not in res and res.get("error", "").startswith("file is bigger"):
                         sys.exit("the server says this file is too big")
                     if code != 200:
-                        raise RuntimeError(f"server said {code}: {res.get('error')}")
+                        raise RuntimeError(f"server said {code}: {res.get('error')} {res.get('detail', '')}")
                     stored += len(piece)
                     rate = (stored - base) / max(time.time() - t0, 1e-6) / 1e6
                     print(f"\r{stored / max(size, 1) * 100:5.1f}%  {stored / 1e6:,.0f}/{size / 1e6:,.0f} MB  {rate:.1f} MB/s",

@@ -7,7 +7,7 @@
 //   CHANNEL_ID, BOT_TOKEN, ADMIN_PASSWORD  -> auto setup + restore on first visit
 //   RESET_PASSWORD (min 6)  -> type it on the login page: it becomes the new admin password. Remove it afterwards.
 //   ADMIN_PASSWORD also works on the login page while it is set (stored password stays unchanged).
-//   TG_API (default https://api.telegram.org), CHUNK_MB (18), MAX_FILE_GB (25),
+//   TG_API (default https://api.telegram.org), CHUNK_MB (8), MAX_FILE_GB (25),
 //   MAX_CHUNKS (22: chunks one response may stream, free plan = 50 subrequests),
 //   SQL_MAX_ROWS (50000), SQL_SYNC_SECS (300: how soon a changed SQL db is backed up to Telegram; "Backup now" / sql! do it at once),
 //   DB_CACHE_BLOCKS (40: 1 MB database blocks kept in RAM), SUBREQ_LIMIT (44: Telegram calls one SQL request may make; a paid plan can use more),
@@ -48,7 +48,7 @@ const unhex = (h) => new Uint8Array((h.match(/../g) || []).map((x) => parseInt(x
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Math.floor(Date.now() / 1000);
 const TG = (env) => (env.TG_API || "https://api.telegram.org").replace(/\/+$/, "");
-const CHUNK = (env) => Math.round(parseFloat(env.CHUNK_MB || "18") * 1024 * 1024);
+const CHUNK = (env) => Math.round(parseFloat(env.CHUNK_MB || "8") * 1024 * 1024);
 const MAX_FILE = (env) => Math.round(parseFloat(env.MAX_FILE_GB || "25") * 1024 ** 3);
 const SQL_MAX_ROWS = (env) => Math.max(1, parseInt(env.SQL_MAX_ROWS || "50000", 10));
 const SQL_SYNC_SECS = (env) => Math.max(5, parseInt(env.SQL_SYNC_SECS || "300", 10));
@@ -602,6 +602,91 @@ async function sendChunk(env, s, fid, n, data) {
   throw last || new Error("send failed");
 }
 
+// ------------------------------------------------------------------ streaming upload (no big buffers)
+// The request body goes straight into the Telegram request while it arrives: memory stays tiny and the Worker does almost
+// no CPU work (the old way copied the whole piece 3-4 times, which can break the free plan limits).
+// A streamed piece cannot be re-sent inside the same request, so on a Telegram error the client simply retries the piece.
+async function drainBody(body) {
+  const r = body.getReader();
+  try {
+    for (;;) if ((await r.read()).done) break;
+  } catch (e) { /* client went away */ }
+}
+async function tgSendStream(env, token, method, fields, file, body, length) {
+  const boundary = "----tgs" + randHex(12);
+  let head = "";
+  for (const [k, v] of Object.entries(fields || {})) head += `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`;
+  head += `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.name}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+  const headB = enc.encode(head);
+  const tailB = enc.encode(`\r\n--${boundary}--\r\n`);
+  const total = headB.length + length + tailB.length;
+  const { readable, writable } = typeof FixedLengthStream !== "undefined" ? new FixedLengthStream(total) : new TransformStream();
+  const reader = body.getReader();
+  const w = writable.getWriter();
+  let pumpErr = null;
+  const pump = (async () => {
+    try {
+      await w.write(headB);
+      let got = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        got += value.length;
+        if (got > length) throw new Error("client sent more than Content-Length");
+        await w.write(value);
+      }
+      if (got !== length) throw new Error("client closed early");
+      await w.write(tailB);
+      await w.close();
+    } catch (e) {
+      pumpErr = e;
+      try { await w.abort(e); } catch (x) { /* ignore */ }
+      try { await reader.cancel(); } catch (x) { /* ignore */ }
+    }
+  })();
+  let res;
+  try {
+    const r = await fetch(`${TG(env)}/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body: readable,
+    });
+    res = await r.json().catch(() => ({ ok: false, error_code: r.status, description: `HTTP ${r.status}` }));
+  } catch (e) {
+    await pump;
+    if (pumpErr) throw pumpErr;
+    throw new TGError(0, "network error");
+  }
+  await pump;
+  if (pumpErr) throw pumpErr;
+  if (!res.ok) throw new TGError(res.error_code || 0, res.description || "", (res.parameters || {}).retry_after || 0);
+  return res.result;
+}
+async function sendChunkStream(env, s, fid, n, body, length) {
+  const [id, wait] = pickUp(s, new Set());
+  try {
+    if (wait > 0) await sleep(Math.min(wait, 8) * 1000);
+    const ch = botChannel(s, id);
+    try {
+      const m = await tgSendStream(env, s.bots[id].token, "sendDocument",
+        { chat_id: ch, caption: `${fid}|${n}`, disable_notification: "true" },
+        { field: "document", name: `${fid}_${String(n).padStart(6, "0")}.bin` }, body, length);
+      poolStat(id);
+      return { n, bot: id, ch, msg: m.message_id, tgid: m.document.file_id, size: length };
+    } catch (e) {
+      if (e instanceof TGError) {
+        poolStat(id, e);
+        console.log(`stream chunk ${n} via bot ${id} failed: ${e.message}`);
+        if (e.code === 429) poolCool(id, e.retry_after || 5);
+        else if ([400, 401, 403, 404].includes(e.code)) poolCool(id, 30);
+      }
+      throw e;
+    }
+  } finally {
+    poolRelease(id);
+  }
+}
+
 // ------------------------------------------------------------------ deleting Telegram messages (bulk, budget aware)
 const DEL_CALLS = 30;
 async function noteDelFail(env, e) {
@@ -783,11 +868,25 @@ async function handleUpload(env, ctx, req, url, pid) {
   const first = offset / csize;
   const haveRows = (await env.DB.prepare("SELECT n FROM chunks WHERE fid = ? AND n >= ? AND n < ?").bind(fid, first, first + nch).all()).results;
   const have = new Set(haveRows.map((r) => r.n));
-  const readN = bodyReader(req);
+  const useStream = nch === 1 && !!req.body && env.HASH_UPLOADS !== "1" && env.UP_STREAM !== "0";
+  const readN = useStream ? null : bodyReader(req);
   const sha1 = q.get("sha") || "";
   const done = [];
   let failure = null;
-  for (let i = 0; i < nch; i++) {
+  if (useStream) {
+    if (Math.min(csize, total - first * csize) !== length) return err(400, "bad piece length", { chunk: csize });
+    if (have.has(first)) await drainBody(req.body);
+    else {
+      try {
+        const r = await sendChunkStream(env, s, fid, first, req.body, length);
+        r.sha = sha1;
+        done.push(r);
+      } catch (e) {
+        failure = e;
+      }
+    }
+  }
+  for (let i = 0; i < (useStream ? 0 : nch); i++) {
     const n = first + i;
     const want = Math.min(csize, total - n * csize);
     const data = await readN(want);
@@ -823,7 +922,7 @@ async function handleUpload(env, ctx, req, url, pid) {
   if (failure) {
     console.log(`upload ${fid} stopped: ${failure.message}`);
     const st = await statusInfo(env, f);
-    return json(502, { error: "upload interrupted", stored: st.stored, have: st.have });
+    return json(502, { error: "upload interrupted", detail: String((failure && failure.message) || failure).slice(0, 200), stored: st.stored, have: st.have });
   }
   if (f.done) {
     await ensureShare(env, fid);
@@ -1299,7 +1398,7 @@ async function projectRoute(env, ctx, req, url, path) {
   const s = await getSettings(env);
   if (sub === "/" && method === "GET") {
     const r = await env.DB.prepare("SELECT COUNT(*) AS c, COALESCE(SUM(stored), 0) AS b FROM files WHERE project = ?").bind(pid).first();
-    return json(200, { project: s.projects[pid].name, files: r.c, bytes: r.b });
+    return json(200, { project: s.projects[pid].name, files: r.c, bytes: r.b, chunk: CHUNK(env), max_up_chunks: Math.max(1, parseInt(env.MAX_UP_CHUNKS || "4", 10)) });
   }
   if (sub === "/sql" && method === "POST") {
     const body = await readJson(req, 30000000).catch((e) => { throw e instanceof ApiError ? e : new ApiError(400, "bad json"); });
