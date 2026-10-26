@@ -236,6 +236,9 @@ class BlockStore {
 }
 
 // ------------------------------------------------------------------ VFS: main.db = BlockStore, everything else (temp files) = RAM
+// wa-sqlite 1.0.0 (Asyncify build): a method that has to wait (Telegram, storage) MUST return this.handleAsync(async () => ...);
+// a plain Promise would be taken for the result code and SQLite would carry on before the data arrived (-> "file is not a database").
+// Methods that never wait (lock, sync, sector size ...) stay normal synchronous functions.
 class TgVFS extends VFS.Base {
   constructor(store) {
     super();
@@ -244,92 +247,112 @@ class TgVFS extends VFS.Base {
     this.files = new Map();
     this.mem = new Map();
   }
-  hasAsyncMethod() { return true; }
-  isReady() { return true; }
   close() {}
   fail(e) { this.store.fail = e; return IOERR; }
-  async xOpen(name, fileId, flags, pOutFlags) {
-    try {
-      const nm = name == null ? "tmp_" + fileId : String(name).replace(/^\/+/, "");
-      const main = nm === MAIN;
-      if (!main && !this.mem.has(nm)) {
-        if (!(flags & OPEN_CREATE)) return CANTOPEN;
-        this.mem.set(nm, { buf: new Uint8Array(8192), size: 0 });
-      }
-      this.files.set(fileId, { name: nm, main, flags });
-      pOutFlags.setInt32(0, flags, true);
+  xOpen(name, fileId, flags, pOutFlags) {
+    return this.handleAsync(async () => {
+      try {
+        const nm = name == null ? "tmp_" + fileId : String(name).replace(/^\/+/, "");
+        const main = nm === MAIN;
+        if (!main && !this.mem.has(nm)) {
+          if (!(flags & OPEN_CREATE)) return CANTOPEN;
+          this.mem.set(nm, { buf: new Uint8Array(8192), size: 0 });
+        }
+        this.files.set(fileId, { name: nm, main, flags });
+        pOutFlags.setInt32(0, flags, true);
+        return OK;
+      } catch (e) { return this.fail(e); }
+    });
+  }
+  xClose(fileId) {
+    return this.handleAsync(async () => {
+      const f = this.files.get(fileId);
+      this.files.delete(fileId);
+      if (f && !f.main && (f.flags & OPEN_DELETEONCLOSE)) this.mem.delete(f.name);
       return OK;
-    } catch (e) { return this.fail(e); }
+    });
   }
-  async xClose(fileId) {
-    const f = this.files.get(fileId);
-    this.files.delete(fileId);
-    if (f && !f.main && (f.flags & OPEN_DELETEONCLOSE)) this.mem.delete(f.name);
-    return OK;
+  xRead(fileId, pData, iOffset) {
+    return this.handleAsync(async () => {
+      try {
+        const f = this.files.get(fileId);
+        if (!f) return IOERR;
+        if (f.main) return await this.store.read(Number(iOffset), pData);
+        const m = this.mem.get(f.name);
+        const off = Number(iOffset);
+        const end = Math.min(off + pData.length, m.size), n = Math.max(end - off, 0);
+        if (n > 0) pData.set(m.buf.subarray(off, end));
+        if (n < pData.length) { pData.fill(0, n); return SHORT_READ; }
+        return OK;
+      } catch (e) { return this.fail(e); }
+    });
   }
-  async xRead(fileId, pData, iOffset) {
-    try {
+  xWrite(fileId, pData, iOffset) {
+    return this.handleAsync(async () => {
+      try {
+        const f = this.files.get(fileId);
+        if (!f) return IOERR;
+        const off = Number(iOffset);
+        if (f.main) {
+          // pData is a view into the wasm heap: copy it before anything is awaited
+          return await this.store.write(off, pData.slice());
+        }
+        const m = this.mem.get(f.name), end = off + pData.length;
+        if (end > m.buf.length) {
+          let cap = m.buf.length;
+          while (cap < end) cap *= 2;
+          const nb = new Uint8Array(cap);
+          nb.set(m.buf.subarray(0, m.size));
+          m.buf = nb;
+        }
+        m.buf.set(pData, off);
+        if (end > m.size) m.size = end;
+        return OK;
+      } catch (e) { return this.fail(e); }
+    });
+  }
+  xTruncate(fileId, iSize) {
+    return this.handleAsync(async () => {
+      try {
+        const f = this.files.get(fileId);
+        if (!f) return IOERR;
+        const sz = Number(iSize);
+        if (f.main) return await this.store.truncate(sz);
+        const m = this.mem.get(f.name);
+        m.buf.fill(0, Math.min(sz, m.buf.length));
+        m.size = Math.min(m.size, sz);
+        return OK;
+      } catch (e) { return this.fail(e); }
+    });
+  }
+  xSync() { return OK; } // changes are made durable by BlockStore.persist() at the end of every request
+  xFileSize(fileId, pSize64) {
+    return this.handleAsync(async () => {
       const f = this.files.get(fileId);
       if (!f) return IOERR;
-      if (f.main) return await this.store.read(iOffset, pData);
-      const m = this.mem.get(f.name);
-      const end = Math.min(iOffset + pData.length, m.size), n = Math.max(end - iOffset, 0);
-      if (n > 0) pData.set(m.buf.subarray(iOffset, end));
-      if (n < pData.length) { pData.fill(0, n); return SHORT_READ; }
+      pSize64.setBigInt64(0, BigInt(f.main ? this.store.size : this.mem.get(f.name).size), true);
       return OK;
-    } catch (e) { return this.fail(e); }
+    });
   }
-  async xWrite(fileId, pData, iOffset) {
-    try {
-      const f = this.files.get(fileId);
-      if (!f) return IOERR;
-      if (f.main) return await this.store.write(iOffset, pData);
-      const m = this.mem.get(f.name), end = iOffset + pData.length;
-      if (end > m.buf.length) {
-        let cap = m.buf.length;
-        while (cap < end) cap *= 2;
-        const nb = new Uint8Array(cap);
-        nb.set(m.buf.subarray(0, m.size));
-        m.buf = nb;
-      }
-      m.buf.set(pData, iOffset);
-      if (end > m.size) m.size = end;
+  xLock() { return OK; } // one query at a time (mutex in ProjDB), no file locks needed
+  xUnlock() { return OK; }
+  xCheckReservedLock(fileId, pResOut) { pResOut.setInt32(0, 0, true); return OK; }
+  xFileControl() { return NOTFOUND; }
+  xSectorSize() { return 4096; }
+  xDeviceCharacteristics() { return 0; }
+  xAccess(name, flags, pResOut) {
+    return this.handleAsync(async () => {
+      const nm = String(name).replace(/^\/+/, "");
+      const ex = nm === MAIN ? this.store.size > 0 : this.mem.has(nm);
+      pResOut.setInt32(0, ex ? 1 : 0, true);
       return OK;
-    } catch (e) { return this.fail(e); }
+    });
   }
-  async xTruncate(fileId, iSize) {
-    try {
-      const f = this.files.get(fileId);
-      if (!f) return IOERR;
-      if (f.main) return await this.store.truncate(iSize);
-      const m = this.mem.get(f.name);
-      m.buf.fill(0, Math.min(iSize, m.buf.length));
-      m.size = Math.min(m.size, iSize);
+  xDelete(name) {
+    return this.handleAsync(async () => {
+      this.mem.delete(String(name).replace(/^\/+/, ""));
       return OK;
-    } catch (e) { return this.fail(e); }
-  }
-  async xSync() { return OK; } // changes are made durable by BlockStore.persist() at the end of every request
-  async xFileSize(fileId, pSize64) {
-    const f = this.files.get(fileId);
-    if (!f) return IOERR;
-    pSize64.setBigInt64(0, BigInt(f.main ? this.store.size : this.mem.get(f.name).size), true);
-    return OK;
-  }
-  async xLock() { return OK; } // one query at a time (mutex in ProjDB), no file locks needed
-  async xUnlock() { return OK; }
-  async xCheckReservedLock(fileId, pResOut) { pResOut.setInt32(0, 0, true); return OK; }
-  async xFileControl() { return NOTFOUND; }
-  async xSectorSize() { return 4096; }
-  async xDeviceCharacteristics() { return 0; }
-  async xAccess(name, flags, pResOut) {
-    const nm = String(name).replace(/^\/+/, "");
-    const ex = nm === MAIN ? this.store.size > 0 : this.mem.has(nm);
-    pResOut.setInt32(0, ex ? 1 : 0, true);
-    return OK;
-  }
-  async xDelete(name) {
-    this.mem.delete(String(name).replace(/^\/+/, ""));
-    return OK;
+    });
   }
 }
 
@@ -676,6 +699,10 @@ export function makeProjDB(H) {
       const need = [];
       for (let i = 0; i < nb; i++) if (st.dirty.has(i) || i >= st.blocks.length || i >= st.cutFrom) need.push(i);
       if (!need.length && st.blocks.length === nb && st.cutFrom === Infinity && !st.garbage.length) return true;
+      if (st.size >= 100) { // safety: never publish (and never delete the old blocks) when the database file does not look like SQLite
+        const h = await st.load(0), magic = "SQLite format 3\0";
+        for (let i = 0; i < magic.length; i++) if (h[i] !== magic.charCodeAt(i)) throw new Error("database header is not valid SQLite - backup skipped, nothing in Telegram was changed");
+      }
       const todo = need.filter((n) => !st.staged.has(n));
       const part = todo.slice(0, max);
       const par = Math.max(1, Math.min(6, H.enabledBotCount(s)));
