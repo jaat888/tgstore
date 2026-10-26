@@ -793,6 +793,26 @@ export function makeProjDB(H) {
       this.ready = false;
       this.pragmas = false;
     }
+    // throw away everything not yet in Telegram (RAM, Durable Object copy of changed blocks, disk cache) and start again from the published blocks
+    async discardLocked() {
+      try { await this.state.storage.deleteAlarm(); } catch (e) { /* ignore */ }
+      try { if (this.db) await this.sqlite3.close(this.db); } catch (e) { /* ignore */ }
+      const st = this.state.storage;
+      const seq = Math.max(this.seq || 0, (await st.get("seq")) || 0);
+      await st.deleteAll();
+      await st.put("pid", this.pid);
+      await st.put("seq", seq);
+      await st.put("legacy", 1);
+      this.db = null;
+      this.sqlite3 = null;
+      this.store = null;
+      this.initP = null;
+      this.ready = false;
+      this.pragmas = false;
+      this.badTx = false;
+      this.err = "";
+      this.initErr = "";
+    }
     async info() {
       const meta = await this.state.storage.get("meta");
       const d = (await this.dbsAll())[this.pid] || {};
@@ -807,6 +827,7 @@ export function makeProjDB(H) {
         if (!this.pid) throw new BadReq("missing project");
         if (p === "/info") return jd(200, await this.info());
         if (p === "/wipe") { await this.lock(() => this.wipeLocked()); return jd(200, { ok: true }); }
+        if (p === "/discard") { await this.lock(() => this.discardLocked()); return jd(200, { ok: true }); }
         if (p === "/sync") { const ok = await this.flush(true); return jd(200, { synced: ok, error: this.err }); }
         if (p === "/run") {
           const body = await req.json();
