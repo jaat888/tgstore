@@ -9,7 +9,7 @@
 //   ADMIN_PASSWORD also works on the login page while it is set (stored password stays unchanged).
 //   TG_API (default https://api.telegram.org), CHUNK_MB (18), MAX_FILE_GB (25),
 //   MAX_CHUNKS (22: chunks one response may stream, free plan = 50 subrequests),
-//   SQL_MAX_ROWS (50000), SQL_SYNC_SECS (20: how soon a changed SQL db is backed up to Telegram),
+//   SQL_MAX_ROWS (50000), SQL_SYNC_SECS (300: how soon a changed SQL db is backed up to Telegram; "Backup now" / sql! do it at once),
 //   DB_CACHE_BLOCKS (40: 1 MB database blocks kept in RAM), SUBREQ_LIMIT (44: Telegram calls one SQL request may make; a paid plan can use more),
 //   DB_DISK_BLOCKS (1024: downloaded blocks also kept in Durable Object storage so a big query can go on in the next request),
 //   SQL_MAX_ROUNDS (20: how many times the Worker re-runs a query that ran out of Telegram calls; free plan allows 50 subrequests per request),
@@ -51,7 +51,7 @@ const TG = (env) => (env.TG_API || "https://api.telegram.org").replace(/\/+$/, "
 const CHUNK = (env) => Math.round(parseFloat(env.CHUNK_MB || "18") * 1024 * 1024);
 const MAX_FILE = (env) => Math.round(parseFloat(env.MAX_FILE_GB || "25") * 1024 ** 3);
 const SQL_MAX_ROWS = (env) => Math.max(1, parseInt(env.SQL_MAX_ROWS || "50000", 10));
-const SQL_SYNC_SECS = (env) => Math.max(5, parseInt(env.SQL_SYNC_SECS || "20", 10));
+const SQL_SYNC_SECS = (env) => Math.max(5, parseInt(env.SQL_SYNC_SECS || "300", 10));
 const MAX_CHUNKS = (env) => Math.max(1, parseInt(env.MAX_CHUNKS || "22", 10));
 
 function tokenUrlsafe(n) {
